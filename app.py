@@ -14,21 +14,7 @@ from google.protobuf.message import DecodeError
 
 app = Flask(__name__)
 
-async def fetch_tokens_from_api(url):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('tokens', [])
-                else:
-                    app.logger.error(f"Failed to fetch tokens from {url}, status: {response.status}")
-                    return []
-    except Exception as e:
-        app.logger.error(f"Error fetching tokens from {url}: {e}")
-        return []
-
-async def load_tokens(server_name):
+def load_tokens(server_name):
     try:
         if server_name == "IND":
             urls = [
@@ -45,23 +31,20 @@ async def load_tokens(server_name):
                 "https://garenafreefiresg-1-tokengenerator.vercel.app/token",
                 "https://garenafreefiresg-2-tokengenerator.vercel.app/token"
             ]
-        
-        tasks = [fetch_tokens_from_api(url) for url in urls]
-        results = await asyncio.gather(*tasks)
-        
+
         tokens = []
-        for result in results:
-            if result:
-                tokens.extend([{"token": token} for token in result])
-        
-        if not tokens:
-            app.logger.error(f"No tokens were fetched for server {server_name}")
-            return None
-        
-        app.logger.info(f"Total tokens loaded for {server_name}: {len(tokens)}")
-        return tokens
+        for url in urls:
+            response = requests.get(url)
+            if response.status_code == 200:
+                json_data = response.json()
+                tokens.extend(json_data.get("tokens", []))
+            else:
+                app.logger.error(f"Failed to fetch tokens from {url}: {response.status_code}")
+
+        return [{"token": t} for t in tokens if t]
+
     except Exception as e:
-        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
+        app.logger.error(f"Error loading tokens for {server_name}: {e}")
         return None
 
 def encrypt_message(plaintext):
@@ -121,26 +104,16 @@ async def send_multiple_requests(uid, server_name, url):
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
             return None
-        
-        tokens = await load_tokens(server_name)
+        tasks = []
+        tokens = load_tokens(server_name)
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
-        
-        # Use all available tokens exactly once
-        tasks = []
-        for token_data in tokens:
-            token = token_data["token"]
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
             tasks.append(send_request(encrypted_uid, token, url))
-        
-        # Wait for all requests to complete
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Count successful requests
-        success_count = sum(1 for result in results if result is not None and isinstance(result, str))
-        app.logger.info(f"Successfully sent {success_count} likes out of {len(tokens)} attempts")
-        
-        return success_count
+        return results
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
@@ -206,7 +179,7 @@ def decode_protobuf(binary):
         return None
 
 @app.route('/like', methods=['GET'])
-async def handle_requests():
+def handle_requests():
     uid = request.args.get("uid")
     server_name = request.args.get("region", "").upper()
     key = request.args.get("key")
@@ -214,12 +187,12 @@ async def handle_requests():
     if not uid or not server_name or not key:
         return jsonify({"error": "UID, region, and key are required"}), 400
 
-    if key != "7yearskeysforujjaiwal":
+    if key != "permanentskeysforujjaiwal":
         return jsonify({"error": "Invalid API key"}), 403
 
     try:
-        async def process_request():
-            tokens = await load_tokens(server_name)
+        def process_request():
+            tokens = load_tokens(server_name)
             if tokens is None:
                 raise Exception("Failed to load tokens.")
             token = tokens[0]['token']
@@ -249,9 +222,7 @@ async def handle_requests():
             else:
                 url = "https://clientbp.ggblueshark.com/LikeProfile"
 
-            success_count = await send_multiple_requests(uid, server_name, url)
-            if success_count is None:
-                raise Exception("Failed to send like requests")
+            asyncio.run(send_multiple_requests(uid, server_name, url))
 
             after = make_request(encrypted_uid, server_name, token)
             if after is None:
@@ -272,13 +243,11 @@ async def handle_requests():
                 "LikesafterCommand": after_like,
                 "PlayerNickname": player_name,
                 "UID": player_uid,
-                "status": status,
-                "TotalRequestsSent": success_count,
-                "ExpectedLikes": len(tokens) if tokens else 0
+                "status": status
             }
             return result
 
-        result = await process_request()
+        result = process_request()
         return jsonify(result)
     except Exception as e:
         app.logger.error(f"Error processing request: {e}")
