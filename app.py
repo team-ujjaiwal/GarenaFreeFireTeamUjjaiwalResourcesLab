@@ -58,6 +58,7 @@ async def load_tokens(server_name):
             app.logger.error(f"No tokens were fetched for server {server_name}")
             return None
         
+        app.logger.info(f"Total tokens loaded for {server_name}: {len(tokens)}")
         return tokens
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
@@ -120,16 +121,26 @@ async def send_multiple_requests(uid, server_name, url):
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
             return None
-        tasks = []
+        
         tokens = await load_tokens(server_name)
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
-        for i in range(100):
-            token = tokens[i % len(tokens)]["token"]
+        
+        # Use all available tokens exactly once
+        tasks = []
+        for token_data in tokens:
+            token = token_data["token"]
             tasks.append(send_request(encrypted_uid, token, url))
+        
+        # Wait for all requests to complete
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
+        
+        # Count successful requests
+        success_count = sum(1 for result in results if result is not None and isinstance(result, str))
+        app.logger.info(f"Successfully sent {success_count} likes out of {len(tokens)} attempts")
+        
+        return success_count
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
@@ -238,7 +249,9 @@ async def handle_requests():
             else:
                 url = "https://clientbp.ggblueshark.com/LikeProfile"
 
-            await send_multiple_requests(uid, server_name, url)
+            success_count = await send_multiple_requests(uid, server_name, url)
+            if success_count is None:
+                raise Exception("Failed to send like requests")
 
             after = make_request(encrypted_uid, server_name, token)
             if after is None:
@@ -259,7 +272,9 @@ async def handle_requests():
                 "LikesafterCommand": after_like,
                 "PlayerNickname": player_name,
                 "UID": player_uid,
-                "status": status
+                "status": status,
+                "TotalRequestsSent": success_count,
+                "ExpectedLikes": len(tokens) if tokens else 0
             }
             return result
 
