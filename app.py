@@ -48,18 +48,21 @@ async def load_tokens(server_name):
                 "https://garenafreefiresg-2-tokengenerator.vercel.app/token"
             ]
         
+        # Fetch tokens from all APIs simultaneously
         tasks = [fetch_tokens_from_api(url) for url in urls]
         results = await asyncio.gather(*tasks)
         
+        # Combine all tokens from all APIs
         tokens = []
         for result in results:
             if result and isinstance(result, list):
                 tokens.extend(result)
-            
+        
         if not tokens:
             app.logger.error(f"No tokens were fetched for server {server_name}")
             return None
-            
+        
+        app.logger.info(f"Successfully loaded {len(tokens)} tokens for region {server_name}")
         return tokens
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
@@ -113,6 +116,15 @@ async def send_request(encrypted_uid, token, url):
 
 async def send_multiple_requests(uid, server_name, url):
     try:
+        # First load all available tokens from both APIs
+        tokens = await load_tokens(server_name)
+        if tokens is None or len(tokens) == 0:
+            app.logger.error("No tokens available to send requests")
+            return None
+        
+        app.logger.info(f"Starting to send requests using {len(tokens)} tokens")
+        
+        # Prepare the encrypted UID
         region = server_name
         protobuf_message = create_protobuf_message(uid, region)
         if protobuf_message is None:
@@ -122,15 +134,21 @@ async def send_multiple_requests(uid, server_name, url):
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
             return None
+        
+        # Create and execute all requests
         tasks = []
-        tokens = await load_tokens(server_name)
-        if tokens is None:
-            app.logger.error("Failed to load tokens.")
-            return None
         for i in range(100):
+            # Round-robin distribution of requests across all tokens
             token = tokens[i % len(tokens)]["token"]
             tasks.append(send_request(encrypted_uid, token, url))
+        
+        # Execute all requests concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Log results
+        success_count = sum(1 for result in results if result == 200)
+        app.logger.info(f"Successfully sent {success_count}/100 requests")
+        
         return results
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
@@ -210,29 +228,32 @@ async def handle_requests():
 
     try:
         async def process_request():
+            # First load all tokens
             tokens = await load_tokens(server_name)
-            if tokens is None:
-                raise Exception("Failed to load tokens.")
+            if tokens is None or len(tokens) == 0:
+                raise Exception("Failed to load tokens or no tokens available.")
+            
+            # Use first token for initial check
             token = tokens[0]['token']
             encrypted_uid = enc(uid)
             if encrypted_uid is None:
                 raise Exception("Encryption of UID failed.")
 
+            # Get before like count
             before = make_request(encrypted_uid, server_name, token)
             if before is None:
                 raise Exception("Failed to retrieve initial player info.")
+            
             try:
                 jsone = MessageToJson(before)
+                data_before = json.loads(jsone)
+                before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
+                before_like = int(before_like) if str(before_like).isdigit() else 0
+                app.logger.info(f"Likes before command: {before_like}")
             except Exception as e:
-                raise Exception(f"Error converting 'before' protobuf to JSON: {e}")
-            data_before = json.loads(jsone)
-            before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
-            try:
-                before_like = int(before_like)
-            except Exception:
-                before_like = 0
-            app.logger.info(f"Likes before command: {before_like}")
+                raise Exception(f"Error processing 'before' data: {e}")
 
+            # Determine endpoint for sending likes
             if server_name == "IND":
                 url = "https://client.ind.freefiremobile.com/LikeProfile"
             elif server_name in {"BR", "US", "SAC", "NA"}:
@@ -240,30 +261,34 @@ async def handle_requests():
             else:
                 url = "https://clientbp.ggblueshark.com/LikeProfile"
 
+            # Send all like requests using all available tokens
             await send_multiple_requests(uid, server_name, url)
 
+            # Get after like count
             after = make_request(encrypted_uid, server_name, token)
             if after is None:
                 raise Exception("Failed to retrieve player info after like requests.")
+            
             try:
                 jsone_after = MessageToJson(after)
+                data_after = json.loads(jsone_after)
+                after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
+                player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
+                player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
+                like_given = after_like - before_like
+                status = 1 if like_given > 0 else (2 if like_given == 0 else 0)
+                
+                result = {
+                    "LikesGivenByAPI": like_given,
+                    "LikesbeforeCommand": before_like,
+                    "LikesafterCommand": after_like,
+                    "PlayerNickname": player_name,
+                    "UID": player_uid,
+                    "status": status
+                }
+                return result
             except Exception as e:
-                raise Exception(f"Error converting 'after' protobuf to JSON: {e}")
-            data_after = json.loads(jsone_after)
-            after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
-            player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
-            player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
-            like_given = after_like - before_like
-            status = 1 if like_given != 0 else 2
-            result = {
-                "LikesGivenByAPI": like_given,
-                "LikesbeforeCommand": before_like,
-                "LikesafterCommand": after_like,
-                "PlayerNickname": player_name,
-                "UID": player_uid,
-                "status": status
-            }
-            return result
+                raise Exception(f"Error processing 'after' data: {e}")
 
         result = await process_request()
         return jsonify(result)
